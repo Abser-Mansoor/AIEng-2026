@@ -1,0 +1,3 @@
+setting,params,batch_x_ctx,val_loss,val_ppl,train_loss,gap,train_time_s,tokens_per_s,peak_mem_mb,valid_word_rate,repetition_rate
+sinusoidal (baseline),3188736,64x128,1.6932,5.437,1.5017,0.1914,111.4,110309,797.9,0.8896,0.0
+learned,3221504,64x128,1.7216,5.593,1.5237,0.1979,111.9,109788,798.1,0.8737,0.0

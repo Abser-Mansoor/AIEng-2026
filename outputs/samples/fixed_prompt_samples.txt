@@ -1,0 +1,71 @@
+model: MiniGPT (3,188,736 params) | checkpoint step 2750 | temperature 0.8 | max_new_tokens 300 | seed per prompt: 1337
+
+===== Sample 1 | prompt: 'ROMEO:' =====
+ROMEO:
+All thy bride will be on, but
+being about to take and my cold and bardity;
+Nurse, by that did how enjoy the confessary,
+And he owes more in her to sleep;
+Which in tell their ladies in the sea,
+Which now thou art self and peace the mild have
+A children her years in a kingdom of the house.
+
+JULIET:
+I
+
+===== Sample 2 | prompt: 'First Citizen:\n' =====
+First Citizen:
+What is the devil, which you that you bear to take
+On the cast and bard thee us of his back:
+And affection my father, will must be some
+for the covertant to cause the senator;
+Still in the speak of love, on that speaks no mean.
+How may child at your son, why now?
+
+POMPEY:
+I think you may let my that
+
+===== Sample 3 | prompt: 'To be, or not to be' =====
+To be, or not to be some scorn'd of a worse
+To threaten a way and answer'd the gate
+My arm that unquest but we than a full of more,
+Than when my father's of in her to stand;
+Which in tears his that Hercutes to the queen.
+
+DUKE VINCENTIO:
+This could shall charge the caise her yea:
+The senators this love more world than
+
+===== Sample 4 | prompt: 'The king' =====
+The king winterful incord,
+The law of my cheeks before and rude the gate
+My arm that unquest but we than a full of more,
+Than when my father's of in her than we will,
+Which ever he will it that Gremia, in me not
+With a supel linease of the mird hath stand and place,
+That made me doth lives to thy woe,
+Becau
+
+===== Sample 5 | prompt: 'JULIET:\n' =====
+JULIET:
+What is they coward? O love the disposition!
+
+CORIOLANUS:
+The hands art thy purpose to be their cause,
+When I do not to God' heart the officer of this;
+And that misters' hand ladies in the sea,
+Which now they absence line of his husband;
+And what have show you love'd no more black whom
+I should that
+
+===== Sample 6 | prompt: 'The future of artificial intelligence' =====
+The future of artificial intelligence?
+
+CLARENCE:
+I will be received a senator, and all the streetche
+he would he shall be that did how enfriced his fast,
+And to heavens me for the covertant like to it;
+Then common is the over-parting long,
+Will I see like to the tent; where he was that
+As let in let the crown to go with thy woes
+Becau

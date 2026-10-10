@@ -1,0 +1,17 @@
+# Render Blueprint. Push this repository to GitHub, then in Render: New > Blueprint > select the repo.
+# (Or create a Web Service manually with the same build/start commands and root directory "deploy".)
+services:
+  - type: web
+    name: minigpt-api
+    runtime: python
+    plan: free
+    rootDir: deploy
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn api:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      # Only needed if you do NOT commit minigpt_best.pt (e.g. host it on a GitHub release / Drive direct link):
+      - key: CHECKPOINT_URL
+        sync: false
