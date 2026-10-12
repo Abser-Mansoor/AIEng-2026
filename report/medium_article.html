@@ -1,0 +1,577 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MiniGPT From Scratch</title>
+<!-- Open this file in a browser, press Ctrl+A then Ctrl+C, and paste into a new Medium story.
+     Medium keeps headings, bold/italic, lists, quotes, code blocks and the hosted images.
+     Styles below are only for previewing in the browser; Medium ignores them. -->
+<style>
+  body { max-width: 720px; margin: 40px auto; padding: 0 16px; font: 18px/1.6 Georgia, serif; color: #222; background: #fff; }
+  h1 { font-size: 2.2em; line-height: 1.2; }
+  h2 { margin-top: 2em; }
+  pre { background: #f4f4f4; padding: 12px; overflow-x: auto; font-size: 14px; line-height: 1.45; }
+  img { max-width: 100%; }
+  figcaption { font-size: 14px; color: #666; text-align: center; }
+  blockquote { border-left: 3px solid #222; margin-left: 0; padding-left: 16px; font-style: italic; }
+</style>
+</head>
+<body>
+
+<h1>Building a GPT From Scratch: A 3.2M-Parameter Shakespeare Model, Tested, Ablated and Deployed</h1>
+
+<p><em>Every piece of a causal Transformer (attention, masking, multi-head attention, positional encoding, the training loop, a CLI, a REST API and a Docker deployment) written by hand in PyTorch, with no pretrained weights, plus what the experiments actually showed.</em></p>
+
+<h2>1. The problem: what we set out to build</h2>
+
+<p>Large language models are easy to <em>use</em> and hard to <em>understand</em>. Calling a hosted API tells you nothing about why attention works, why GPT needs a causal mask, or what the dozens of design choices inside a Transformer actually buy you.</p>
+
+<p>So the goal of this project was to build a small but complete <strong>causal language model</strong> end to end, without shortcuts:</p>
+
+<ul>
+  <li><strong>No pretrained checkpoints.</strong> No GPT-2, BERT or Llama weights, and no <code>AutoModelForCausalLM</code>. Every weight starts from random initialisation.</li>
+  <li><strong>Every component written by hand:</strong> scaled dot-product attention, the causal mask, multi-head split/merge, sinusoidal positional encoding, pre-norm residual blocks, the feed-forward network, the LM head, the sampler and the training loop.</li>
+  <li><strong>Verified, not just run:</strong> 23 unit and acceptance tests, a tiny-overfit debugging gate, and controlled ablations.</li>
+  <li><strong>Shipped:</strong> a standalone inference module, a command-line tool, a FastAPI service and a Docker deployment answering live requests.</li>
+</ul>
+
+<p>The scenario is deliberately small: a <strong>character-level model trained on Tiny Shakespeare</strong> that, given a prompt such as <code>ROMEO:</code>, continues it in Shakespeare's style. It is small enough to train in under four minutes on a free Colab GPU, but large enough that every phenomenon worth studying (attention patterns, overfitting, sampling failures, scaling with depth) shows up clearly.</p>
+
+<h2>2. Transformer foundations</h2>
+
+<h3>Why attention? Sequential depth vs. parallel work</h3>
+
+<p>A recurrent network computes <code>h_t = f(h_{t−1}, x_t)</code>: step <em>t</em> cannot start until step <em>t−1</em> has finished. A sequence of length T therefore needs <strong>T dependent steps</strong>, however many cores you have. Attention instead lets every position look at every other position in <strong>one batched matrix multiplication</strong>. That is O(T²·d) total work, but only one sequential step.</p>
+
+<p>We measured this directly on a Tesla T4 (batch 8, d = 64):</p>
+
+<pre>  T   | sequential (s) | parallel (s) | speed-up
+------+----------------+--------------+---------
+  32  |    0.001646    |   0.000691   |   2.4×
+  64  |    0.003053    |   0.001361   |   2.2×
+ 128  |    0.006679    |   0.000177   |  37.8×
+ 256  |    0.015723    |   0.000237   |  66.4×</pre>
+
+<p>The sequential loop's time grows roughly linearly with T, while the parallel version stays almost flat. Transformers trade sequential depth for parallel work, and GPUs are very good at parallel work. That trade is the main reason Transformers replaced RNNs.</p>
+
+<h3>Scaled dot-product attention</h3>
+
+<p>Each position produces a <strong>query</strong> (what am I looking for?), a <strong>key</strong> (what do I contain?) and a <strong>value</strong> (what do I pass on?):</p>
+
+<pre>Q = X·W_Q        K = X·W_K        V = X·W_V
+
+Attention(Q, K, V) = softmax( Q·Kᵀ / √d_k  +  M ) · V</pre>
+
+<p><code>Q·Kᵀ</code> is a T × T matrix of similarity scores between every query position <em>i</em> and key position <em>j</em>. Dividing by <code>√d_k</code> keeps the variance of the scores near 1 as the dimension grows. Without it, large dot products push the softmax into a near one-hot regime where gradients vanish. The softmax turns each row into a probability distribution, and that distribution weights the values.</p>
+
+<h3>The causal mask: what makes it GPT and not BERT</h3>
+
+<p><code>M</code> is the causal mask:</p>
+
+<pre>M[i, j] = 0     if j ≤ i   (past or present: allowed)
+M[i, j] = −∞    if j > i   (future: blocked)
+
+e.g. T = 4:     j→  0    1    2    3
+           i=0  [   0   −∞   −∞   −∞ ]
+           i=1  [   0    0   −∞   −∞ ]
+           i=2  [   0    0    0   −∞ ]
+           i=3  [   0    0    0    0 ]</pre>
+
+<p>After the softmax, <code>e^(−∞) = 0</code>, so every future position gets <strong>exactly zero</strong> weight. This matters because GPT is trained on <em>next-token prediction</em>: position <em>i</em> must predict token <em>i+1</em>. If it could see token <em>i+1</em>, the task would be trivial copying, and the model would learn nothing useful for generation, where the future does not exist yet.</p>
+
+<p>BERT has a different objective: it hides tokens by replacing them with <code>[MASK]</code> and predicts them from both sides. Because the target is removed from the input rather than just placed later in it, BERT can let every position attend to every other position. Same architecture, different objective, different mask.</p>
+
+<h3>Multi-head attention</h3>
+
+<p>One attention pattern per layer is limiting: a position may need to look at the previous letter <em>and</em> the start of the current word at the same time. Multi-head attention runs H attention operations in parallel on lower-dimensional slices:</p>
+
+<pre>head_h = Attention(Q·W_Q^h, K·W_K^h, V·W_V^h)          h = 1 … H,  d_head = d_model / H
+MultiHead(X) = Concat(head_1, …, head_H) · W_O</pre>
+
+<p>Here is the tensor-shape trace from our implementation (B = 2, T = 12, d_model = 256, H = 8):</p>
+
+<pre>input                        (2, 12, 256)    (B, T, d_model)
+[1] Q/K/V projections        (2, 12, 256)    (B, T, d_model)
+[2] split_heads              (2, 8, 12, 32)  (B, H, T, d_head)
+[3] attention weights        (2, 8, 12, 12)  (B, H, T, T)
+[3] per-head output          (2, 8, 12, 32)  (B, H, T, d_head)
+[4] merge_heads (concat)     (2, 12, 256)    (B, T, d_model)
+[5] output projection W_O    (2, 12, 256)    (B, T, d_model)</pre>
+
+<h3>Positional encoding</h3>
+
+<p>Attention by itself is <em>permutation-invariant</em>: shuffle the input and the outputs are shuffled the same way. Nothing in it knows that "dog bites man" differs from "man bites dog". We add fixed sinusoidal position signals to the token embeddings:</p>
+
+<pre>PE(pos, 2i)   = sin( pos / 10000^(2i / d_model) )
+PE(pos, 2i+1) = cos( pos / 10000^(2i / d_model) )</pre>
+
+<p>Each pair of dimensions oscillates at a different frequency, so every position gets a unique fingerprint. A fixed offset between two positions also corresponds to a linear transformation of their encodings, which makes relative position easy to learn. The encoding has <strong>zero trainable parameters</strong>.</p>
+
+<h3>The Transformer block</h3>
+
+<p>We use the <strong>pre-norm</strong> layout of modern GPTs, which trains more stably than the original post-norm design:</p>
+
+<pre>x = x + Dropout( MultiHeadAttention( LayerNorm(x) ) )
+x = x + Dropout( FFN( LayerNorm(x) ) )
+
+FFN(x) = W₂ · GELU( W₁·x + b₁ ) + b₂        (d_model → 4·d_model → d_model)</pre>
+
+<p>The residual connections give gradients a direct path through the network, so each sub-layer only learns a <em>correction</em> to the representation. Attention moves information <strong>between</strong> positions, and the FFN processes information <strong>within</strong> each position. The block maps (B, T, d_model) to (B, T, d_model), so blocks stack.</p>
+
+<h3>The full model</h3>
+
+<pre>token ids                        (B, T)
+ → token embedding × √d_model    (B, T, 256)
+ → + sinusoidal positions        (B, T, 256)
+ → dropout
+ → 4 × TransformerBlock (causal) (B, T, 256)
+ → final LayerNorm               (B, T, 256)
+ → LM head (Linear 256 → 65)     (B, T, 65)    logits over the vocabulary
+
+loss = CrossEntropy( logits.view(B·T, 65), targets.view(B·T) )</pre>
+
+<h2>3. Implementation</h2>
+
+<h3>Tokenizer</h3>
+
+<p>The tokenizer is <strong>character-level</strong>. The vocabulary is the sorted set of distinct characters in the corpus, which makes it fully deterministic, and has <strong>65 symbols</strong>:</p>
+
+<pre>"\n !$&amp;',-.3:;?ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+
+'First Citizen:' → [18, 47, 56, 57, 58, 1, 15, 47, 58, 47, 64, 43, 52, 10] → 'First Citizen:'</pre>
+
+<p>There are <strong>no special tokens</strong>: no padding (we always cut fixed-length windows), no BOS/EOS and no UNK. During training an unknown character raises an error. During inference it is skipped (<code>errors="skip"</code>), and the API reports which characters were dropped. Character-level tokenization keeps the vocabulary tiny and needs no trained tokenizer. The cost is long sequences and a model that has to build words letter by letter, which matters later.</p>
+
+<h3>Model configuration</h3>
+
+<pre>vocab_size      65
+context_length  128 characters
+d_model         256
+n_heads         4      (d_head = 64)
+n_layers        4
+ffn_dim         1024   (4 × d_model)
+dropout         0.1
+tie_weights     False</pre>
+
+<p>Weights are initialised from N(0, 0.02). Following GPT-2, the residual output projections (<code>W_O</code> and the FFN's second layer) are scaled down by <code>1/√(2·n_layers)</code>, so the residual stream's variance does not grow with depth. Token embeddings are multiplied by <code>√d_model</code> so the unit-amplitude sinusoidal positions do not swamp them.</p>
+
+<h3>Attention and masking in code</h3>
+
+<p>The core of the implementation is a few lines:</p>
+
+<pre>def build_causal_mask(T, device=None):
+    # True where key position j is in the future of query position i
+    return torch.triu(torch.ones(T, T, dtype=torch.bool, device=device), diagonal=1)
+
+def scaled_dot_product_attention(Q, K, V, mask=None, causal=False):
+    d_k = Q.shape[-1]
+    scores = (Q @ K.transpose(-2, -1)) / math.sqrt(d_k)          # (..., T, T)
+    if causal:
+        T_q, T_k = scores.shape[-2], scores.shape[-1]
+        causal_mask = build_causal_mask(max(T_q, T_k), scores.device)[:T_q, :T_k]
+        mask = causal_mask if mask is None else (mask | causal_mask)
+    if mask is not None:
+        scores = scores.masked_fill(mask, float("-inf"))
+    attn_weights = F.softmax(scores, dim=-1)
+    return attn_weights @ V, attn_weights</pre>
+
+<p>The function broadcasts over any leading dimensions, so multi-head attention reuses it unchanged on (B, H, T, d_head) tensors. It also returns the attention weights, which is what makes the attention inspection in Section 6 possible.</p>
+
+<p><strong>Proving the mask works.</strong> We perturbed <em>only the last token</em> of a sequence and measured how much the output at <em>position 0</em> changed:</p>
+
+<pre>Causal (GPT-style) block:          change at position 0 = 0.00000000
+Bidirectional (BERT-style) block:  change at position 0 = 0.22196493</pre>
+
+<p>We repeated the test on the fully trained model: changing the last character of a 48-character input left every earlier position's logits unchanged (a maximum difference of exactly <strong>0.0</strong>), while the last position's logits changed by up to 9.45.</p>
+
+<h3>Next-token targets</h3>
+
+<p>Targets are the inputs shifted left by one character:</p>
+
+<pre>x = ids[s     : s + T]        # input
+y = ids[s + 1 : s + T + 1]    # target: y[t] is the character after x[t]
+
+ t | input | target
+ 0 |  'F'  |  'i'
+ 1 |  'i'  |  'r'
+ 2 |  'r'  |  's'
+ 3 |  's'  |  't'</pre>
+
+<p>One forward pass therefore produces T training signals at once, one per position. That is only possible because the causal mask stops position <em>t</em> from seeing <em>y[t]</em>, which is the input at <em>t+1</em>.</p>
+
+<h3>Training loop</h3>
+
+<ul>
+  <li><strong>AdamW</strong> (β = 0.9, 0.95) with weight decay 0.1 applied <em>only to matrices</em>. Biases and LayerNorm gains are not decayed.</li>
+  <li><strong>Learning-rate schedule:</strong> linear warm-up, then cosine decay to a floor of one-tenth of the peak rate.</li>
+  <li><strong>Gradient clipping</strong> at a norm of 1.0.</li>
+  <li>Logs of training loss, learning rate and throughput (tokens/s) every 50 steps. A <strong>validation pass every 250 steps</strong> also prints a sample, so you can watch the text go from noise to Shakespeare.</li>
+  <li><strong>Best-validation checkpointing.</strong> The checkpoint stores the weights, the model config <em>and the tokenizer vocabulary</em>, so a fresh process can rebuild everything from one file.</li>
+</ul>
+
+<p><strong>Debugging gate.</strong> Before any long run, a small model must memorise a single fixed batch. If it can't, something is broken. Our model drove the loss from <strong>4.21 to 0.0002</strong> in 300 steps, which confirms that gradients, target shifting and masking all work together. The same discipline extends to <strong>23 test functions</strong> covering shapes, softmax normalisation, mask correctness at every level, the target shift, tokenizer round-trips, checkpoint reloads and causality of the trained model. All 23 pass.</p>
+
+<h2>4. Dataset and preprocessing</h2>
+
+<ul>
+  <li><strong>Source:</strong> Tiny Shakespeare, the corpus from Andrej Karpathy's <em>char-rnn</em> repository (also published on Hugging Face as <code>tiny_shakespeare</code>). It is a concatenation of excerpts from Shakespeare's plays.</li>
+  <li><strong>Size:</strong> 1,115,394 characters in 40,000 lines (about 1.1 MB).</li>
+  <li><strong>Tokenizer and vocabulary:</strong> character-level, 65 symbols, no special tokens (see above).</li>
+  <li><strong>Split:</strong> the first 90% for training (1,003,854 characters) and the last 10% for validation (111,540 characters). The split is <strong>contiguous, not shuffled</strong>. A random split would put overlapping windows of the same text in both sets and inflate validation scores.</li>
+  <li><strong>Context length:</strong> 128 characters. Training batches are random 128-character windows from the training split.</li>
+  <li><strong>Filtering:</strong> none. The text is used exactly as downloaded, with no lower-casing, deduplication or cleaning. With a 65-character vocabulary there is nothing to normalise, and keeping speaker names, line breaks and punctuation is what lets the model learn the play format.</li>
+</ul>
+
+<h2>5. Training setup</h2>
+
+<pre>Hardware       Google Colab · NVIDIA Tesla T4 (14.6 GB) · 2 CPU cores
+Software       PyTorch 2.11 (CUDA 13.0) · Python 3.13
+Optimizer      AdamW, β = (0.9, 0.95), weight decay 0.1 (matrices only)
+Learning rate  peak 6e-4, 200 warm-up steps, cosine decay to 6e-5
+Batch size     64 sequences × 128 characters = 8,192 tokens / step
+Steps          3,000  → 24.6 M tokens ≈ 24.5 passes over the training split
+Regularisation dropout 0.1, gradient clipping 1.0
+Evaluation     every 250 steps, 50 validation batches
+Checkpoints    minigpt_best.pt (lowest validation loss), minigpt_last.pt (final step)
+Seed           1337</pre>
+
+<p>The handout suggested a learning rate around 3e-4. We used 6e-4 because a 3M-parameter model with warm-up tolerates a higher rate, and the curve stayed smooth. Because the model sees the corpus about 24 times, overfitting was a real risk. Dropout slows it down, and best-validation checkpointing makes sure any late overfitting would show in the curve without affecting the final model.</p>
+
+<h2>6. Results</h2>
+
+<h3>Parameter count</h3>
+
+<pre>component                                  shape            params
+-----------------------------------------------------------------
+token embedding                            (65, 256)        16,640
+positional encoding (fixed, not trained)   (128, 256)            0
+  per block: multi-head attention          4 × (256×256)   262,144
+  per block: feed-forward (GELU MLP)       256→1024→256    525,568
+  per block: 2 × LayerNorm                 2 × 256           1,024
+all 4 Transformer blocks                                 3,154,944
+final LayerNorm                            (256,)              512
+LM head                                    (256, 65)        16,640
+-----------------------------------------------------------------
+TOTAL                                                    3,188,736  (≈3.19 M, 12.2 MB fp32)</pre>
+
+<p>Two thirds of every block's parameters are in the feed-forward network, not in attention. That ratio holds for full-scale GPTs too.</p>
+
+<h3>Training time</h3>
+
+<p>The full run took <strong>3.9 minutes</strong> (236.8 s) at an average of <strong>103,789 tokens/s</strong>, with a peak GPU memory of <strong>749 MB</strong>.</p>
+
+<h3>Loss curves</h3>
+
+<figure>
+<img src="https://raw.githubusercontent.com/Abser-Mansoor/AIEng-2026/main/outputs/figures/fig6_loss_curves.png" alt="MiniGPT training and validation loss curves">
+<figcaption>Training vs. validation loss. The red dotted line is ln(65) ≈ 4.17, the loss of a uniform random guess.</figcaption>
+</figure>
+
+<p><strong>Observation.</strong> Both curves start at the uniform-guess baseline, ln(65) ≈ 4.17, as they should for a randomly initialised model. Validation loss falls steeply to 2.25 by step 250, then flattens: 1.74 at step 1000, 1.58 at step 2000, and a minimum at <strong>step 2750</strong>. At step 3000 it is essentially unchanged.</p>
+
+<p><strong>Interpretation.</strong> The model has reached a plateau but has not yet clearly overfit. Validation loss has not turned upward. The training curve sits above validation early on only because it is measured with dropout active.</p>
+
+<p>For the final numbers we reloaded the best checkpoint and scored <strong>both splits the same way</strong>: eval mode, with non-overlapping windows covering the entire split.</p>
+
+<pre>                 loss     perplexity   bits/char
+train            1.302      3.68
+validation       1.538      4.66        2.22
+uniform guess    4.174     65.00        6.02
+train–val gap    0.236</pre>
+
+<p>A validation perplexity of 4.66 means the model is, on average, about as uncertain as choosing among 4–5 equally likely characters, down from 65.</p>
+
+<h3>Sample generations</h3>
+
+<p>From the best checkpoint at temperature 0.8, with the seed fixed before each prompt so the samples are reproducible:</p>
+
+<pre>ROMEO:
+All thy bride will be on, but
+being about to take and my cold and bardity;
+Nurse, by that did how enjoy the confessary,
+And he owes more in her to sleep;
+Which in tell their ladies in the sea,
+Which now thou art self and peace the mild have
+A children her years in a kingdom of the house.
+
+JULIET:
+I</pre>
+
+<pre>To be, or not to be some scorn'd of a worse
+To threaten a way and answer'd the gate
+My arm that unquest but we than a full of more,
+Than when my father's of in her to stand;
+Which in tears his that Hercutes to the queen.
+
+DUKE VINCENTIO:
+This could shall charge the caise her yea:</pre>
+
+<p>For comparison, the untrained model's output was <code>ROMEO:?qf;xbDkRZkNdc.wj,ZT,OLFT,eHtK…</code></p>
+
+<p>The trained model has clearly learned the <em>form</em> of the text: speaker names in capitals followed by a colon, line breaks at verse length, archaic vocabulary (<em>thy</em>, <em>thou art</em>), contractions (<em>scorn'd</em>, <em>answer'd</em>) and real character names (<em>Nurse</em>, <em>JULIET</em>, <em>DUKE VINCENTIO</em>). On average <strong>94% of generated words are real words</strong> from the training vocabulary. What it has not learned is <em>meaning</em>: the lines are grammatical-ish fragments with no consistent thread.</p>
+
+<h3>Attention inspection</h3>
+
+<p>We fed the trained model a validation snippet, <code>"d mild behavior,\nAm bold to show myself a forwar"</code>, and plotted the attention weights of all 16 heads.</p>
+
+<figure>
+<img src="https://raw.githubusercontent.com/Abser-Mansoor/AIEng-2026/main/outputs/figures/fig7_attention_grid.png" alt="Attention weights of all 16 heads">
+<figcaption>Attention weights of every head (rows = query position, columns = key position).</figcaption>
+</figure>
+
+<p><strong>Observations:</strong></p>
+
+<ul>
+  <li><strong>Every panel is strictly lower-triangular.</strong> The causal mask holds in the trained model. An acceptance test confirms the maximum weight above the diagonal is below 10⁻⁶ in every layer.</li>
+  <li><strong>Early layers are local.</strong> Layer 0 heads are almost pure diagonal bands. The average weight on the <em>previous</em> character is 0.42, 0.39 and 0.46 for heads 0, 2 and 3. Layer 1 head 3 is the strongest previous-token head at 0.54. These heads mostly learn which letter follows which.</li>
+  <li><strong>Layer 2, head 0 looks at line starts.</strong> It shows one bright vertical stripe: almost every character after the line break attends to the same column, the <strong>newline</strong>. Its previous-token weight is only 0.07, the lowest of all 16 heads.</li>
+  <li><strong>Later layers are more spread out</strong> and harder to summarise. They draw on many earlier positions.</li>
+</ul>
+
+<figure>
+<img src="https://raw.githubusercontent.com/Abser-Mansoor/AIEng-2026/main/outputs/figures/fig7_attention_single_head.png" alt="Layer 3 head 0 attention with character labels">
+<figcaption>Layer 3, head 0, with character labels (· = space, ↵ = newline).</figcaption>
+</figure>
+
+<p>The labelled view of <strong>layer 3, head 0</strong> shows a clear pattern. Every letter of <em>behavior</em> attends strongly to the <strong>space just before the "b"</strong>. The letters of <em>show</em> attend to the space before the "s", and those of <em>forwar</em> to the space before the "f".</p>
+
+<blockquote>Interpretation: this head seems to track where the current word began. For a model that spells one character at a time, knowing how far into a word it is, and how the word started, is exactly what it needs to finish the word.</blockquote>
+
+<p>A caveat: this comes from a single snippet. The pattern is an observation, and the "word-start head" label is an interpretation that would need many more examples to confirm.</p>
+
+<h2>7. Ablation study</h2>
+
+<p>We ran three required experiments and two optional ones. To keep them <strong>controlled</strong>:</p>
+
+<ul>
+  <li>Only the variable under test changes. Everything else matches the baseline: 4 layers, 4 heads, context 128, d_model 256, dropout 0.1, the same optimiser, schedule and seed.</li>
+  <li>Every run trains for <strong>1,500 steps</strong> with the <strong>same 8,192 tokens per step</strong>. For the context experiment the batch size is adjusted (<code>batch = 8192 / context</code>), so every model sees the same amount of text.</li>
+  <li>The baseline is trained once and shared across experiments.</li>
+  <li>Losses use the same deterministic full-split evaluation as above. Because the runs are half as long as the main model, the baseline reaches 1.693 rather than 1.538.</li>
+</ul>
+
+<figure>
+<img src="https://raw.githubusercontent.com/Abser-Mansoor/AIEng-2026/main/outputs/figures/fig9_ablation.png" alt="Ablation results">
+<figcaption>Top row: final validation loss (y-axis truncated; baseline in orange). Bottom row: validation curves during training. In the context-length panel the orange bar labelled "4" is the 128-character baseline; this is a labelling quirk from reusing the shared baseline run.</figcaption>
+</figure>
+
+<h3>Experiment 1: depth (2 / 4 / 6 layers)</h3>
+
+<pre>layers   params    val loss   train loss   gap     time     tokens/s   valid words
+  2      1.61 M     1.765       1.585      0.180    59 s    209,920      85.3%
+  4      3.19 M     1.693       1.502      0.191   111 s    110,309      89.0%
+  6      4.77 M     1.651       1.452      0.199   166 s     73,837      90.0%</pre>
+
+<p><strong>Observation.</strong> Each added pair of layers lowered validation loss (−0.072, then −0.042) and raised the share of real words. Parameters and training time grow linearly with depth.</p>
+
+<p><strong>Interpretation.</strong> Depth is the most effective of the three knobs, but with diminishing returns: the second step gives about 60% of the gain of the first, for the same added cost. The train–val gap widens only slightly (0.180 → 0.199), so the deeper model is genuinely better and not simply memorising. Its validation curve is also still falling at step 1500, which suggests it would gain more from longer training.</p>
+
+<h3>Experiment 2: attention heads (2 / 4 / 8)</h3>
+
+<pre>heads   d_head   params    val loss   tokens/s   peak mem   valid words
+  2      128     3.19 M     1.697     114,807    766 MB       85.1%
+  4       64     3.19 M     1.693     110,309    798 MB       89.0%
+  8       32     3.19 M     1.701      99,959    862 MB       86.3%</pre>
+
+<p><strong>Observation.</strong> Validation loss is essentially flat. The 0.008 spread is within single-seed noise, and the validation curves (bottom-centre panel) lie on top of each other. More heads made training slower and used more memory.</p>
+
+<p><strong>Interpretation.</strong> With d_model fixed, changing the head count <strong>does not change the parameter count</strong>. It only re-slices the same 256 dimensions into more, narrower heads. At this scale the trade-off between more attention patterns and less capacity per pattern is roughly neutral. The extra cost comes from the larger (B, H, T, T) attention tensors. Four heads gave the best valid-word rate, but with one seed we would not treat that as significant.</p>
+
+<h3>Experiment 3: context length (64 / 128 / 256)</h3>
+
+<pre>context   batch    val loss   tokens/s   peak mem   valid words
+   64     128×64     1.675    115,630    766 MB       88.1%
+  128     64×128     1.693    110,309    798 MB       89.0%
+  256     32×256     1.741     98,360    862 MB       81.6%</pre>
+
+<p><strong>Observation.</strong> Counter-intuitively, the <em>shortest</em> context gave the <em>lowest</em> validation loss, and the 256-character model was clearly worst, both in loss and in real-word rate. Longer contexts also cost throughput (−15%) and memory (+13%).</p>
+
+<p><strong>Interpretation.</strong> More context should never hurt a fully trained model, so this mostly says something about a <em>fixed, short training budget</em>:</p>
+
+<ul>
+  <li>With tokens per step held fixed, the 64-context model sees <strong>128 independent windows per step</strong> and the 256-context model only 32. That gives the shorter model more varied gradients.</li>
+  <li>For character-level Shakespeare, most of the predictive signal (spelling, the current word, the last line) is within a few dozen characters. The extra context beyond 64 has little to offer a model this small after 1,500 steps.</li>
+  <li>Longer windows also mean attention has more positions to spread over, which plausibly takes longer to learn to use. All three curves are still falling, and the 256 model's curve is the steepest at the end.</li>
+</ul>
+
+<p>The honest conclusion: <strong>at this budget, longer context did not pay for itself.</strong> Whether it would with longer training is an open question this experiment cannot answer.</p>
+
+<h3>Optional: learned vs. sinusoidal positions</h3>
+
+<pre>position encoding   params      val loss   valid words
+sinusoidal (fixed)  3,188,736    1.693       89.0%
+learned (table)     3,221,504    1.722       87.4%</pre>
+
+<p>A trainable position table added 32,768 parameters and was <em>worse</em> by 0.028. With only 1,500 steps, a learned table has to discover position from scratch, while sinusoids provide it for free from step 0.</p>
+
+<h3>Optional: decoding strategy (no retraining)</h3>
+
+<pre>strategy            valid-word rate   repetition rate
+greedy (T = 0)          98.3%             39.4%
+T = 0.5                 97.6%              0.0%
+T = 0.8 (default)       94.5%              0.0%
+T = 1.0                 93.2%              0.0%
+T = 1.3                 77.8%              0.0%
+T = 0.8, top-k = 40     94.5%              0.0%</pre>
+
+<p>Temperature trades correctness for variety. Greedy decoding spells best but repeats itself badly. High temperature never repeats but invents words. Top-k = 40 changed nothing at T = 0.8: with a 65-character vocabulary, the 40 most likely characters already hold almost all of the probability mass.</p>
+
+<h2>8. Failure analysis</h2>
+
+<h3>Failure 1: repetition loops under greedy decoding</h3>
+
+<pre>I am to the common of the country of the country.
+
+KING RICHARD III:
+The state of the court of the country,
+That I will be the strange of the country's son,
+And the state of the seat of the seat of the sea
+The sease of the strange of the season of the state,
+And she shall be the strange of the seat,
+And the state of the seat of the seat of the sea</pre>
+
+<p><strong>Evidence:</strong> a repetition rate of 0.394 for greedy decoding vs. 0.000 at T = 0.8. Whole lines repeat word for word.</p>
+
+<p><strong>Likely cause:</strong> greedy decoding always picks the single most likely next character. Once the text enters a high-probability cycle (<em>"of the seat of the sea…"</em>), the same context produces the same choice, and the loop reinforces itself. A 128-character window makes it worse, because the model cannot see that it already wrote this line a paragraph ago. Sampling breaks the cycle by sometimes choosing a less likely character.</p>
+
+<h3>Failure 2: invented words at higher temperature</h3>
+
+<pre>temperature   words not in the training vocabulary
+   0.5              13 / 517   ( 2.5%)
+   1.0              39 / 492   ( 7.9%)
+   1.3              99 / 448   (22.1%)
+
+examples at T = 1.3:  somerry, overtage, lesing, furny, senatore, nybirty, smoock, treasts</pre>
+
+<p><strong>Likely cause:</strong> a character-level model has <em>no word list</em>. It builds every word one letter at a time. Raising the temperature flattens the distribution, so plausible but wrong letters get sampled more often, producing non-words that <em>look</em> English (<em>senatore</em>, <em>overtage</em>). A word- or subword-level tokenizer could never output a non-word, because every token would be a known piece.</p>
+
+<h3>Failure 3: out-of-domain prompts and unsupported characters</h3>
+
+<pre>prompt sent:            'The future of AI in 2026: self-driving cars &amp; GPUs'
+prompt the model sees:  'The future of AI in : self-driving cars &amp; GPUs'
+characters dropped:     ['0', '2', '6']
+
+continuation:
+ter;
+And thy cowarding law by my cheeks before.
+Stir-hard the hause art thy purchased to hearl.</pre>
+
+<p><strong>Likely cause:</strong> the vocabulary is only the 65 characters in the corpus, which has no digits except "3". Anything else is dropped before the model sees it. Even with valid characters, the model has only ever seen one author's style, so a modern prompt is simply ignored and the model returns to Shakespeare. This is the clearest reminder that a language model's knowledge is bounded by its training data.</p>
+
+<h3>Failure 4: different prompts converging on the same lines</h3>
+
+<p>With the same seed, the <code>To be, or not to be</code> and <code>The king</code> samples both produce the identical line <em>"My arm that unquest but we than a full of more,"</em>. The out-of-domain prompt's continuation also ends with the same two lines as the <code>ROMEO:</code> sample (<em>"Which now thou art self and peace the mild have / A children her years in a kingdom of the house."</em>).</p>
+
+<p><strong>Likely cause:</strong> when the prompt carries little information the model can use, its predictions fall back to a few high-probability paths through Shakespeare-like text. Fed the same random numbers, different prompts end up on the same path. The prompt shapes only the first few lines.</p>
+
+<h2>9. Engineering packaging</h2>
+
+<p>A notebook is not a product. The inference code is packaged separately:</p>
+
+<pre>submission/deployment/
+  minigpt.py          standalone model + tokenizer + checkpoint loader (inference only)
+  generate.py         command-line interface
+  api.py              FastAPI service: GET /, GET /health, POST /generate
+  minigpt_best.pt     trained checkpoint (12.3 MB)
+  requirements.txt    CPU-only torch, fastapi, uvicorn
+  Dockerfile          python:3.11-slim, non-root user, built-in health check
+  docker-compose.yml  host port 80 → container port 8000, restart unless-stopped</pre>
+
+<p><code>minigpt.py</code> restates the architecture without any training code, so the server never imports the notebook. A test loads the exported checkpoint through this module and checks that its greedy output is <strong>token-for-token identical</strong> to the notebook model's, so the two copies of the architecture cannot silently diverge.</p>
+
+<h3>Command-line inference</h3>
+
+<pre>pip install -r submission/deployment/requirements.txt
+cd submission/deployment
+python generate.py --prompt "ROMEO:" --max-new-tokens 150 --temperature 0.8 --seed 1337</pre>
+
+<pre>Prompt: ROMEO:
+Generated:
+ROMEO:
+All thy bride will be on, but
+being about to take and my cold and bardity;
+Nurse, by that did how enjoy the confessary,
+And he owes more in her to sl
+---
+model parameters: 3.19M
+context length: 128
+temperature: 0.8
+top_k: None
+seed: 1337</pre>
+
+<p>Flags: <code>--temperature 0</code> for greedy decoding, <code>--top-k 40</code> for top-k sampling, <code>--seed</code> for reproducibility, <code>--checkpoint</code> for a different model file.</p>
+
+<h3>REST API</h3>
+
+<pre>uvicorn api:app --host 0.0.0.0 --port 8000
+
+curl -X POST http://localhost:8000/generate \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "ROMEO:", "max_new_tokens": 100, "temperature": 0.8, "seed": 1}'</pre>
+
+<pre>{
+  "prompt": "ROMEO:",
+  "generated": "ROMEO:\nCamillo;\nMen me ungly that may be my shame with a virtue,\nAnd he more a mistain of the heavy west:\n",
+  "ignored_characters": [],
+  "parameters": 3188736,
+  "context_length": 128,
+  "temperature": 0.8,
+  "top_k": null,
+  "seconds": 3.726
+}</pre>
+
+<p>Requests are validated with Pydantic: the prompt can be at most 500 characters, <code>max_new_tokens</code> 1–500, temperature 0–2 and top-k 1–100. Out-of-range input such as <code>"temperature": 99</code> gets an HTTP <strong>422</strong> before it reaches the model. The response lists any <code>ignored_characters</code>, so callers know when part of their prompt was dropped. A lock makes the seed and generation atomic, so concurrent requests cannot interfere with each other's random state. Interactive Swagger documentation is served at <code>/docs</code>.</p>
+
+<h3>Deployment</h3>
+
+<p>The service runs as a Docker container on a Contabo VPS and is live at <strong>http://62.169.21.107/</strong> (try <code>/docs</code>). Deployment takes three commands on the server:</p>
+
+<pre>git clone https://github.com/Abser-Mansoor/AIEng-2026.git
+cd AIEng-2026/submission/deployment
+docker compose up -d --build</pre>
+
+<p>On this CPU-only VPS, generation takes about <strong>45 ms per character</strong>: 100 characters in roughly 4 seconds. Generation is inherently sequential, with one full forward pass per new character, so it cannot use the parallelism that makes training fast. That is the same sequential-vs-parallel trade-off from Section 2, now on the inference side.</p>
+
+<h3>Reproducibility</h3>
+
+<ul>
+  <li>A fixed seed (1337) for Python, NumPy and PyTorch. Each sample prompt and each ablation run re-seeds, so results don't depend on execution order.</li>
+  <li>The checkpoint stores the weights, the model config, the training config and the <strong>tokenizer vocabulary</strong>. A single file is enough to rebuild the model in a new process, and a test checks that a reloaded checkpoint generates identically.</li>
+  <li>The notebook runs top to bottom in Colab, downloads the dataset itself, and writes every figure, CSV and sample to <code>outputs/</code>. Full run logs (configs, hardware, loss history) are saved to <code>outputs/logs/minigpt_run.json</code>.</li>
+  <li>A <code>seed</code> field in the API makes live responses reproducible too.</li>
+</ul>
+
+<h2>10. Conclusion</h2>
+
+<p>Building every piece by hand and then testing it makes the main ideas of causal language modelling concrete:</p>
+
+<ol>
+  <li><strong>The causal mask is what turns a Transformer into a generator.</strong> One <code>torch.triu</code> call is the difference between GPT and BERT. We showed it holds exactly: perturbing future tokens changes past outputs by 0.0, before and after training.</li>
+  <li><strong>Next-token prediction alone teaches structure.</strong> With no labels and no notion of words, 3.2M parameters trained for four minutes learned spelling (94% real words), verse layout, speaker turns and archaic grammar, cutting perplexity from 65 to 4.66.</li>
+  <li><strong>Attention heads specialise in readable ways.</strong> Early layers attend to the previous character, while deeper heads track line starts and word starts. This is a small-scale version of the circuits found in large models.</li>
+  <li><strong>Depth matters more than head count at fixed width.</strong> Going from 2 to 6 layers improved loss steadily, with diminishing returns. Changing the head count at the same parameter count did nothing measurable, and more context only pays off with enough training to use it.</li>
+  <li><strong>Loss is not the whole story.</strong> The same model can loop endlessly (greedy) or invent words (T = 1.3) depending on decoding. The tokenizer decides which inputs the model can even see, and a small, single-author dataset sets hard limits on what it can say.</li>
+</ol>
+
+<p>Everything that makes models like ChatGPT work is already present in this model: attention, causal masking, residual depth and next-token prediction. What separates the two is mostly scale (data, parameters and compute) together with tokenization and training techniques built on top of the same core.</p>
+
+<h3>Links</h3>
+
+<ul>
+  <li>Code, notebook and figures: <a href="https://github.com/Abser-Mansoor/AIEng-2026">github.com/Abser-Mansoor/AIEng-2026</a></li>
+  <li>Live API: <a href="http://62.169.21.107/docs">http://62.169.21.107/docs</a></li>
+</ul>
+
+<h3>References</h3>
+
+<ol>
+  <li>Vaswani, A. et al. (2017). <em>Attention Is All You Need.</em> NeurIPS.</li>
+  <li>Radford, A. et al. (2019). <em>Language Models are Unsupervised Multitask Learners</em> (GPT-2).</li>
+  <li>Devlin, J. et al. (2019). <em>BERT: Pre-training of Deep Bidirectional Transformers for Language Understanding.</em> NAACL.</li>
+  <li>Karpathy, A. <em>char-rnn</em>, Tiny Shakespeare dataset: <a href="https://github.com/karpathy/char-rnn">github.com/karpathy/char-rnn</a></li>
+  <li>Loshchilov, I. &amp; Hutter, F. (2019). <em>Decoupled Weight Decay Regularization</em> (AdamW). ICLR.</li>
+</ol>
+
+</body>
+</html>
