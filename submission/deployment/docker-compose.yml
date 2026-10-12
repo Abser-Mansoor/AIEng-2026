@@ -1,0 +1,11 @@
+services:
+  minigpt-api:
+    build: .
+    image: minigpt-api:latest
+    ports:
+      - "80:8000"
+    environment:
+      PORT: "8000"
+      # Only needed if the checkpoint is not baked into the image:
+      # CHECKPOINT_URL: "https://example.com/minigpt_best.pt"
+    restart: unless-stopped

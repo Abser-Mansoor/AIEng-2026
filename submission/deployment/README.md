@@ -4,8 +4,6 @@ A small GPT-style, character-level causal language model (attention, multi-head 
 positions, residual blocks, LayerNorm, FFN, LM head) implemented in PyTorch **without any pretrained model**,
 trained on Tiny Shakespeare.
 
-> TODO: add team names, course, and links (Colab notebook, Medium report, demo video, live API).
-
 ## Repository layout
 | Path | What it is |
 |---|---|
@@ -47,11 +45,10 @@ curl -X POST http://localhost:8000/generate -H "Content-Type: application/json" 
 ```
 Interactive docs at `/docs`. Health check at `/health`.
 
-## Deploy on Render
+## Deployment on Contabo
 1. Push the repository (including `deploy/minigpt_best.pt`, or set `CHECKPOINT_URL`) to GitHub.
-2. Render dashboard > New > Blueprint > pick the repo (uses `deploy/render.yaml`), or create a Web Service with
-   root directory `deploy`, build `pip install -r requirements.txt`, start `uvicorn api:app --host 0.0.0.0 --port $PORT`.
-3. Live URL: TODO. Note: the free tier sleeps when idle, so the first request after a pause is slow.
+2. Pull the repository on the Contabo server.
+3. Build the Docker image and start the server using `docker-compose.yml`
 
 ## Tests
 The notebook runs every `test_*` function (attention shapes, causal masking, target shifting, end-to-end causality,
@@ -62,6 +59,3 @@ checkpoint reload, exported-module equivalence) and a tiny-overfit gate.
 - Trained on ~1 MB of one author; output imitates the style but is not factual or semantically coherent over long spans.
 - Greedy decoding loops; high temperature invents words (see the failure analysis in the report).
 - Context window is 128 characters; earlier text is forgotten during longer generations.
-
-## Sources
-TODO: cite the Tiny Shakespeare source, "Attention Is All You Need" (Vaswani et al., 2017), and any tutorial code you adapted.
